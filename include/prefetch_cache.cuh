@@ -27,17 +27,20 @@ namespace nv {
 namespace merlin {
 
 template <class T>
+using system_atomic = cuda::atomic<T, cuda::thread_scope_system>;
+template <class T>
 using device_atomic = cuda::atomic<T, cuda::thread_scope_device>;
 
 using device_barrier = cuda::barrier<cuda::thread_scope_device>;
 
-template <class K>
+template <class K, cuda::thread_scope N_ERASURES_SCOPE>
 inline __device__ void pref_inv_add(
     const K key, const uint32_t count, const uint32_t capacity,
     device_atomic<uint32_t>* const size,
     device_atomic<uint32_t>* const num_tombstones,
     device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
-    device_atomic<uint32_t>* const n_insertions, K* const inserted_keys) {
+    cuda::atomic<uint32_t, N_ERASURES_SCOPE>* const n_insertions,
+    K* const inserted_keys) {
   assert(key != EMPTY_KEY && key != RECLAIM_KEY);
 
   using key_type = K;
@@ -108,6 +111,49 @@ inline __device__ void pref_inv_add(
     slot_idx = n_insertions->fetch_add(1, cuda::memory_order_relaxed);
     if (inserted_keys) {
       inserted_keys[slot_idx] = key;
+    }
+  }
+}
+
+template <class K, cuda::thread_scope N_ERASURES_SCOPE>
+inline __device__ void pref_inv_drop(
+    const K key, const uint32_t capacity,
+    device_atomic<uint32_t>* const num_tombstones,
+    device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
+    cuda::atomic<uint32_t, N_ERASURES_SCOPE>* const n_erasures,
+    K* const erased_keys) {
+  assert(key != EMPTY_KEY && key != RECLAIM_KEY);
+
+  using key_type = K;
+
+  const uint32_t origin_slot_idx{
+      static_cast<uint32_t>(Murmur3HashDevice(key) % capacity)};
+
+  // Linearly probe to locate slot.
+  key_type old_key;
+  uint32_t slot_idx;
+  for (slot_idx = origin_slot_idx;; slot_idx = (slot_idx + 1) % capacity) {
+    // Scan until we either find the key or an empty slot.
+    old_key = key_slots[slot_idx].load(cuda::memory_order_relaxed);
+    if (old_key == key) {
+      break;
+    }
+
+    // This should not happen if the cache is sufficiently sized.
+    assert(old_key != EMPTY_KEY);
+  }
+
+  const uint32_t count{
+      ref_slots[slot_idx].fetch_sub(1, cuda::memory_order_relaxed)};
+  assert(count >= 1);
+  if (count == 1) {
+    key_slots[slot_idx].store(RECLAIM_KEY, cuda::memory_order_relaxed);
+    num_tombstones->fetch_add(1, cuda::memory_order_relaxed);
+    if (n_erasures) {
+      slot_idx = n_erasures->fetch_add(1, cuda::memory_order_relaxed);
+      if (erased_keys) {
+        erased_keys[slot_idx] = key;
+      }
     }
   }
 }
@@ -237,13 +283,14 @@ __global__ void pref_inv_invoke_cleanup_kernel(
   cleanup_sync->arrive_and_wait();
 }
 
-template <class K>
+template <class K, cuda::thread_scope N_INSERTIONS_SCOPE>
 __global__ void pref_inv_add_kernel(
     const K* const keys, const uint32_t num_keys, const uint32_t capacity,
     device_atomic<uint32_t>* const size,
     device_atomic<uint32_t>* const num_tombstones,
     device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
-    device_atomic<uint32_t>* const n_insertions, K* const inserted_keys) {
+    cuda::atomic<uint32_t, N_INSERTIONS_SCOPE>* const n_insertions,
+    K* const inserted_keys) {
   assert(capacity - size->load(cuda::memory_order_relaxed) >= num_keys);
 
   const uint32_t tid{blockIdx.x * blockDim.x + threadIdx.x};
@@ -253,18 +300,18 @@ __global__ void pref_inv_add_kernel(
   }
 }
 
-template <class K>
+template <class K, cuda::thread_scope N_INSERTIONS_SCOPE>
 __global__ void pref_inv_invoke_cleanup_add_kernel(
     const K* const keys, const uint32_t num_keys, const uint32_t capacity,
     device_atomic<uint32_t>* const size,
     device_atomic<uint32_t>* const num_tombstones,
     device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
     device_barrier* const cleanup_sync,
-    device_atomic<uint32_t>* const n_insertions, K* const inserted_keys) {
+    cuda::atomic<uint32_t, N_INSERTIONS_SCOPE>* const n_insertions,
+    K* const inserted_keys, const uint32_t grid_size,
+    const uint32_t block_size) {
   const uint32_t tid{blockIdx.x * blockDim.x + threadIdx.x};
   assert(tid == 0);
-
-  constexpr uint32_t block_size{512};
 
   if (num_tombstones->load(cuda::memory_order_relaxed) > capacity / 4) {  // 25%
     const uint32_t grid_size{(capacity + block_size - 1) / block_size};
@@ -280,49 +327,42 @@ __global__ void pref_inv_invoke_cleanup_add_kernel(
     n_insertions->store(0, cuda::memory_order_relaxed);
   }
 
-  const uint32_t grid_size{(num_keys + block_size - 1) / block_size};
   pref_inv_add_kernel<<<grid_size, block_size>>>(
       keys, num_keys, capacity, size, num_tombstones, key_slots, ref_slots,
       n_insertions, inserted_keys);
 }
 
-template <class K>
+template <class K, cuda::thread_scope N_ERASURES_SCOPE>
 __global__ void pref_inv_drop_kernel(
     const K* const keys, const uint32_t num_keys, const uint32_t capacity,
-    const device_atomic<uint32_t>* const size,
     device_atomic<uint32_t>* const num_tombstones,
-    device_atomic<K>* const key_slots,
-    device_atomic<uint32_t>* const ref_slots) {
-  using key_type = K;
-
+    device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
+    cuda::atomic<uint32_t, N_ERASURES_SCOPE>* const n_erasures,
+    K* const erased_keys) {
   const uint32_t tid{blockIdx.x * blockDim.x + threadIdx.x};
   if (tid < num_keys) {
-    const key_type key{keys[tid]};
-    const uint32_t origin_slot_idx{
-        static_cast<uint32_t>(Murmur3HashDevice(key) % capacity)};
-
-    // Linearly probe to locate slot.
-    key_type old_key;
-    uint32_t slot_idx;
-    for (slot_idx = origin_slot_idx;; slot_idx = (slot_idx + 1) % capacity) {
-      // Scan until we either find the key or an empty slot.
-      old_key = key_slots[slot_idx].load(cuda::memory_order_relaxed);
-      if (old_key == key) {
-        break;
-      }
-
-      // This should not happen if the cache is sufficiently sized.
-      assert(old_key != EMPTY_KEY);
-    }
-
-    const uint32_t count{
-        ref_slots[slot_idx].fetch_sub(1, cuda::memory_order_relaxed)};
-    assert(count >= 1);
-    if (count == 1) {
-      key_slots[slot_idx].store(RECLAIM_KEY, cuda::memory_order_relaxed);
-      num_tombstones->fetch_add(1, cuda::memory_order_relaxed);
-    }
+    pref_inv_drop(keys[tid], capacity, num_tombstones, key_slots, ref_slots,
+                  n_erasures, erased_keys);
   }
+}
+
+template <class K, cuda::thread_scope N_ERASURES_SCOPE>
+__global__ void pref_inv_invoke_drop_kernel(
+    const K* const keys, const uint32_t num_keys, const uint32_t capacity,
+    device_atomic<uint32_t>* const num_tombstones,
+    device_atomic<K>* const key_slots, device_atomic<uint32_t>* const ref_slots,
+    cuda::atomic<uint32_t, N_ERASURES_SCOPE>* const n_erasures,
+    K* const erased_keys, const uint32_t grid_size, const uint32_t block_size) {
+  const uint32_t tid{blockIdx.x * blockDim.x + threadIdx.x};
+  assert(tid == 0);
+
+  if (n_erasures) {
+    n_erasures->store(0, cuda::memory_order_relaxed);
+  }
+
+  pref_inv_drop_kernel<<<grid_size, block_size>>>(
+      keys, num_keys, capacity, num_tombstones, key_slots, ref_slots,
+      n_erasures, erased_keys);
 }
 
 template <class K>
@@ -408,31 +448,68 @@ class PrefetchInventory final {
 
   inline void add(const key_type* const dh_keys, const size_type n,
                   cudaStream_t stream) {
-    return add(dh_keys, n, nullptr, stream);
+    add(dh_keys, n, nullptr, stream);
   }
 
   inline void add(const key_type* const dh_keys, const size_type n,
-                  size_type* d_n_insertions, cudaStream_t stream) {
-    return add(dh_keys, n, d_n_insertions, nullptr, stream);
+                  size_type* dh_n_insertions, cudaStream_t stream) {
+    add(dh_keys, n, dh_n_insertions, nullptr, stream);
   }
 
   inline void add(const key_type* const dh_keys, size_type n,
-                  size_type* const d_n_insertions,
+                  size_type* const dh_n_insertions,
                   key_type* const dh_inserted_keys, cudaStream_t stream) {
-    pref_inv_invoke_cleanup_add_kernel<<<1, 1, 0, stream>>>(
-        dh_keys, n, capacity, d_size_, d_num_reclaimed_, d_key_slots_,
-        d_ref_slots_, d_cleanup_sync_,
-        reinterpret_cast<device_atomic<size_type>*>(d_n_insertions),
-        dh_inserted_keys);
+    constexpr uint32_t block_size{512};
+    const size_t grid_size{SAFE_GET_GRID_SIZE(n, block_size)};
+
+    cudaPointerAttributes attr;
+    CUDA_CHECK(cudaPointerGetAttributes(&attr, dh_n_insertions));
+    if (attr.type == cudaMemoryTypeDevice) {
+      pref_inv_invoke_cleanup_add_kernel<<<1, 1, 0, stream>>>(
+          dh_keys, n, capacity, d_size_, d_num_reclaimed_, d_key_slots_,
+          d_ref_slots_, d_cleanup_sync_,
+          reinterpret_cast<device_atomic<size_type>*>(dh_n_insertions),
+          dh_inserted_keys, grid_size, block_size);
+
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+      pref_inv_invoke_cleanup_add_kernel<<<1, 1, 0, stream>>>(
+          dh_keys, n, capacity, d_size_, d_num_reclaimed_, d_key_slots_,
+          d_ref_slots_, d_cleanup_sync_,
+          reinterpret_cast<system_atomic<size_type>*>(dh_n_insertions),
+          dh_inserted_keys, grid_size, block_size);
+    }
   }
 
   inline void drop(const key_type* const dh_keys, const size_type n,
                    cudaStream_t stream) {
+    drop(dh_keys, n, nullptr, stream);
+  }
+
+  inline void drop(const key_type* const dh_keys, const size_type n,
+                   size_type* const dh_n_erasures, cudaStream_t stream) {
+    drop(dh_keys, n, dh_n_erasures, nullptr, stream);
+  }
+
+  inline void drop(const key_type* const dh_keys, const size_type n,
+                   size_type* const dh_n_erasures, K* const dh_erased_keys,
+                   cudaStream_t stream) {
     constexpr uint32_t block_size{512};
     const size_t grid_size{SAFE_GET_GRID_SIZE(n, block_size)};
-    pref_inv_drop_kernel<<<grid_size, block_size, 0, stream>>>(
-        dh_keys, n, capacity, d_size_, d_num_reclaimed_, d_key_slots_,
-        d_ref_slots_);
+
+    cudaPointerAttributes attr;
+    CUDA_CHECK(cudaPointerGetAttributes(&attr, dh_n_erasures));
+    if (attr.type == cudaMemoryTypeDevice) {
+      pref_inv_invoke_drop_kernel<<<1, 1, 0, stream>>>(
+          dh_keys, n, capacity, d_num_reclaimed_, d_key_slots_, d_ref_slots_,
+          reinterpret_cast<device_atomic<size_type>*>(dh_n_erasures),
+          dh_erased_keys, grid_size, block_size);
+    } else {
+      pref_inv_invoke_drop_kernel<<<1, 1, 0, stream>>>(
+          dh_keys, n, capacity, d_num_reclaimed_, d_key_slots_, d_ref_slots_,
+          reinterpret_cast<system_atomic<size_type>*>(dh_n_erasures),
+          dh_erased_keys, grid_size, block_size);
+    }
   }
 
   size_type size(cudaStream_t stream) const;
@@ -461,6 +538,7 @@ class PrefetchInventory final {
 
   friend std::ostream& operator<<<K>(std::ostream&, const PrefetchInventory&);
 
+ public:
   const size_type capacity;
 
  private:
